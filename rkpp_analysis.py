@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import Data
+import rkpp_opcode_payload
 
 logger = logging.getLogger(__name__)
 
@@ -657,6 +658,75 @@ def _raw_dump(msg: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _resolve_message_def(msgs: dict[str, dict], message_name: str | None) -> tuple[str, dict | None]:
+    key = _normalize_type(str(message_name or ""))
+    if not key:
+        return "", None
+    msg_def = msgs.get(key)
+    if msg_def is not None:
+        return key, msg_def
+    short = key.rsplit(".", 1)[-1]
+    msg_def = msgs.get(short)
+    if msg_def is not None:
+        return short, msg_def
+    return key, None
+
+
+def _codec_schema_for_message(msgs: dict[str, dict], message_name: str | None) -> dict | None:
+    _key, msg_def = _resolve_message_def(msgs, message_name)
+    if msg_def is None:
+        return None
+    fields = []
+    for no_text, fdef in sorted(
+        (msg_def.get("fields") or {}).items(),
+        key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0,
+    ):
+        try:
+            no = int(no_text)
+        except (TypeError, ValueError):
+            continue
+        ftype = _normalize_type(str(fdef.get("type") or ""))
+        item: dict[str, Any] = {
+            "no": no,
+            "name": fdef.get("name") or f"field_{no}",
+        }
+        if fdef.get("message"):
+            item["type"] = "message"
+            item["ref"] = ftype
+        elif fdef.get("enum"):
+            item["type"] = f"enum<{ftype}>"
+        else:
+            item["type"] = ftype
+        if fdef.get("repeated"):
+            item["repeated"] = True
+        if fdef.get("packed"):
+            item["packed"] = True
+        if fdef.get("desc"):
+            item["desc"] = fdef["desc"]
+        fields.append(item)
+    return {"fields": fields}
+
+
+def _decode_payload_by_codec(
+    msgs: dict[str, dict],
+    message_name: str,
+    payload_hex: str,
+) -> tuple[dict[str, Any], str] | None:
+    schema = _codec_schema_for_message(msgs, message_name)
+    if schema is None:
+        return None
+    try:
+        payload = bytes.fromhex(payload_hex)
+    except ValueError:
+        return None
+
+    def resolve_message(name: str) -> dict | None:
+        return _codec_schema_for_message(msgs, name)
+
+    result = rkpp_opcode_payload.decode_opcode_payload(schema, payload, resolve_message)
+    return result.decoded, result.source
+
+
 def _build_decode_result(
     record: dict[str, Any],
     info: dict[str, Any],
@@ -664,6 +734,7 @@ def _build_decode_result(
     schema_found: bool,
     message_name: str | None,
     decoded: dict[str, Any],
+    decode_source: str = "field_tree",
 ) -> dict[str, Any]:
     return {
         "opcode": record.get("opcode"),
@@ -675,6 +746,7 @@ def _build_decode_result(
         "pb_full_name": info.get("pb_full_name"),
         "pb_proto_file": info.get("pb_proto_file"),
         "decoded": _enrich_known_id_names(decoded),
+        "decode_source": decode_source,
     }
 
 
@@ -697,15 +769,17 @@ def decode_record(record: dict[str, Any]) -> dict[str, Any] | None:
 
     info = lookup_opcode(opcode)
     msg_name = info.get("name")
+    decode_name = info.get("decode_as") or info.get("full_name") or msg_name
     root = record.get("root")
     special_payload = record.get("special_payload")
-    if root is None or msg_name is None:
+    if root is None or decode_name is None:
         return _build_decode_result(
             record,
             info,
             schema_found=False,
             message_name=msg_name,
             decoded=_raw_dump(root) if root else {},
+            decode_source="raw",
         )
 
     if isinstance(special_payload, dict):
@@ -715,21 +789,38 @@ def decode_record(record: dict[str, Any]) -> dict[str, Any] | None:
             schema_found=False,
             message_name=msg_name,
             decoded=dict(special_payload),
+            decode_source="special_payload",
         )
 
     _, schema = _ensure_loaded()
     msgs = schema.get("messages", {})
+    resolved_name, msg_def = _resolve_message_def(msgs, decode_name)
+    schema_found = msg_def is not None
 
-    # 尝试在 schema 中查找 message 定义
-    decoded = {}
-    if msg_name in msgs:
-        decoded = decode_by_schema(root, msg_name)
+    decoded: dict[str, Any]
+    decode_source = "field_tree"
+    payload_hex = record.get("payload_hex")
+    if schema_found and isinstance(payload_hex, str):
+        try:
+            codec_result = _decode_payload_by_codec(msgs, resolved_name, payload_hex)
+        except Exception:
+            codec_result = None
+            logger.debug("payload codec decode failed for opcode=%s message=%s",
+                         record.get("opcode_hex"), resolved_name, exc_info=True)
+        if codec_result is not None:
+            decoded, decode_source = codec_result
+        else:
+            decoded = decode_by_schema(root, resolved_name)
+    elif schema_found:
+        decoded = decode_by_schema(root, resolved_name)
     else:
         decoded = _raw_dump(root) if root else {}
+        decode_source = "raw"
     return _build_decode_result(
         record,
         info,
-        schema_found=msg_name in msgs,
-        message_name=msg_name,
+        schema_found=schema_found,
+        message_name=resolved_name or msg_name,
         decoded=decoded,
+        decode_source=decode_source,
     )

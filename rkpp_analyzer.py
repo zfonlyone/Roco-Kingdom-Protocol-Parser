@@ -28,7 +28,7 @@ import rkpp_proto as proto
 import rkpp_analysis as analysis
 from rkpp_io import CsvSink, SessionLogger, now_text
 from rkpp_network import (Be21Packet, FlowState,
-                           decrypt_4013_body, flow_key_from_packet,
+                           decrypt_4013_body_candidates, flow_key_from_packet,
                            packet_has_target_port, printable_ascii, write_key_file)
 
 logger = logging.getLogger(__name__)
@@ -634,30 +634,43 @@ class RkppAnalyzer:
             row["decrypt_status"] = "no_key"
             return row, None
         try:
-            iv, plain = decrypt_4013_body(flow.key, be21.body)
+            candidates = decrypt_4013_body_candidates(flow.key, be21.body)
         except ValueError as exc:
             # 解密失败——可能是 key 错误或数据截断
             self._record_error(f"decrypt_fail:{exc}", be21.seq)
             row["decrypt_status"] = f"decrypt_error:{exc}"
             return row, None
 
-        row.update({
-            "decrypt_status": "ok", "iv_hex": iv.hex(),
-            "cipher_hex": be21.body[16:].hex(), "decrypted_body_hex": plain.hex(),
-        })
+        last_row = row
+        last_error = "parse_unparsed"
+        for mode, iv, cipher, plain in candidates:
+            trial_row = self._build_base_row(flow, be21, packet, frame_no)
+            trial_row.update({
+                "decrypt_status": "ok", "decrypt_mode": mode, "iv_hex": iv.hex(),
+                "cipher_hex": cipher.hex(), "decrypted_body_hex": plain.hex(),
+            })
+            try:
+                parsed_info = self._parse_decrypted(trial_row, flow, be21, packet, frame_no, plain)
+                if parsed_info is None:
+                    last_row = trial_row
+                    last_error = f"parse_unparsed:{mode}:{trial_row.get('decrypt_status')}"
+                    continue
+                self.parsed_business_records += 1
+                self._consecutive_errors = 0  # 成功则重置连续错误计数
+                return trial_row, parsed_info
+            except Exception as exc:
+                last_row = trial_row
+                last_error = f"parse_error:{mode}:{exc}"
+                trial_row["decrypt_status"] = f"parse_error:{exc}"
 
-        try:
-            parsed_info = self._parse_decrypted(row, flow, be21, packet, frame_no, plain)
-            if parsed_info is None:
-                self._record_error(f"parse_unparsed:{row.get('decrypt_status')}", be21.seq)
-                return row, None
-            self.parsed_business_records += 1
-            self._consecutive_errors = 0  # 成功则重置连续错误计数
-            return row, parsed_info
-        except Exception as exc:
-            self._record_error(f"parse_error:{exc}", be21.seq)
-            row["decrypt_status"] = f"parse_error:{exc}"
-            return row, None
+        if last_error.endswith(":ok_unparsed"):
+            self._record_unparsed(last_error, be21.seq)
+        else:
+            self._record_error(last_error, be21.seq)
+        return last_row, None
+
+    def _record_unparsed(self, reason: str, seq: int) -> None:
+        logger.debug("Packet seq=%s unparsed: %s", seq, reason)
 
     def _record_error(self, error_msg: str, seq: int) -> None:
         """记录错误并在连续失败时告警。"""
@@ -687,13 +700,14 @@ class RkppAnalyzer:
             "key_hex": flow.key.hex() if flow.key else "",
             "key_ascii": printable_ascii(flow.key) if flow.key else "",
             **{k: "" for k in (
-                "decrypt_status", "iv_hex", "cipher_hex", "decrypted_body_hex",
+                "decrypt_status", "decrypt_mode", "iv_hex", "cipher_hex", "decrypted_body_hex",
                 "transport_kind", "transport_layout", "transport_seq", "record_len",
                 "session_id_hex", "sub_id_hex",
                 "protocol_direction", "opcode", "opcode_hex", "raw_opcode", "raw_opcode_hex",
                 "opcode_normalized", "opcode_name", "opcode_desc",
                 "subtype", "magic_hex",
                 "req_seq", "payload_len", "payload_trailer_len", "root_clean", "inner_message_id",
+                "decode_source",
                 "summary_kind", "summary_text", "summary_json",
                 "decoded_json", "record_json", "root_json",
             )},
@@ -811,6 +825,8 @@ class RkppAnalyzer:
                 decoded_available = "decoded" in schema_result
                 record["_schema_found"] = schema_result.get("schema_found", False)
                 record["_message_name"] = schema_result.get("message_name", "")
+                record["_decode_source"] = schema_result.get("decode_source", "")
+                row["decode_source"] = schema_result.get("decode_source", "")
         except Exception:
             logger.debug("schema decode failed for opcode=%s seq=%s",
                          record.get("opcode_hex"), seq, exc_info=True)

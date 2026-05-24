@@ -317,7 +317,7 @@ def prompt_text(prompt: str, default: str | None = None) -> str:
 
 def prompt_menu() -> str:
     while True:
-        v = input("请选择功能 1=抓key 2=解包 3=战斗实时解析 4=opencode中转Server: ").strip()
+        v = input("请选择功能 1=抓key 2=解包 3=协议实时解析 4=opencode中转Server: ").strip()
         if v in {"1", "2", "3", "4"}:
             return v
         print("输入无效，请输入 1、2、3 或 4。")

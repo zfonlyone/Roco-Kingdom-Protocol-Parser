@@ -16,7 +16,7 @@
 子命令：
   capture-key    抓取首个 0x1002 key，输出 key.txt
   live-decode    持续抓包解密，导出 CSV
-  battle-analyze 持续抓包 + 战斗实时解析 + CSV
+  analyze        持续抓包 + 协议实时解析 + CSV
 
 无子命令时进入交互式菜单。
 """
@@ -34,7 +34,7 @@ from rkpp_io import (CsvSink, MoveCsvSink, SessionLogger, ensure_output_dir,
                       iter_offline_packets, prompt_menu, prompt_server_mode, prompt_text)
 from rkpp_network import list_ifaces, load_key_from_file, packet_has_target_port, parse_key_text
 from rkpp_relay import OpcodeRelayServer
-from rkpp_reporter import BattleConsoleReporter
+from rkpp_reporter import ProtocolConsoleReporter
 
 DEFAULT_PORT = 8195
 SCRIPT_DIR   = Path(__file__).resolve().parent
@@ -44,14 +44,14 @@ _BAD_KEY_EXIT_CODE = 2
 _COMMAND_CONFIG = {
     "capture-key":    ("rkpp_key_capture",     False, False, True),
     "live-decode":    ("rkpp_live_decode",      True,  False, False),
-    "battle-analyze": ("rkpp_battle_analyze",   True,  True,  False),
+    "analyze":        ("rkpp_analyze",          True,  True,  False),
     "opencode-server":("rkpp_opencode_server",  True,  False, False),
 }
 
 _INTERACTIVE_COMMANDS = {
     "1": "capture-key",
     "2": "live-decode",
-    "3": "battle-analyze",
+    "3": "analyze",
     "4": "opencode-server",
 }
 
@@ -125,7 +125,7 @@ def _session_exit_code(
 
 
 # ---------------------------------------------------------------------------
-# 统一运行函数（合并原 run_capture_key / run_live_decode / run_battle_analyze）
+# 统一运行函数（合并原 run_capture_key / run_live_decode / run_analyze）
 # ---------------------------------------------------------------------------
 
 def run_command(args: argparse.Namespace) -> int:
@@ -143,7 +143,7 @@ def run_command(args: argparse.Namespace) -> int:
     csv_sink: CsvSink | None = None
     move_csv_sink: MoveCsvSink | None = None
     writer: PcapWriter | None = None
-    reporter: BattleConsoleReporter | None = None
+    reporter: ProtocolConsoleReporter | None = None
     relay: OpcodeRelayServer | None = None
 
     try:
@@ -160,7 +160,7 @@ def run_command(args: argparse.Namespace) -> int:
             preset_key = parse_key_text(args.key)
 
         if needs_reporter:
-            reporter = BattleConsoleReporter(logger=session_logger)
+            reporter = ProtocolConsoleReporter(logger=session_logger)
 
         if command == "opencode-server":
             server_mode = getattr(args, "server_mode", "normal")
@@ -292,10 +292,10 @@ def build_parser() -> argparse.ArgumentParser:
     _key_arg(live)
     _csv_arg(live)
 
-    battle = sub.add_parser("battle-analyze", help="持续抓包并实时输出战斗解析，同时导出 CSV")
-    _common(battle)
-    _key_arg(battle)
-    _csv_arg(battle)
+    analyze = sub.add_parser("analyze", help="持续抓包并实时输出协议解析，同时导出 CSV")
+    _common(analyze)
+    _key_arg(analyze)
+    _csv_arg(analyze)
 
     relay = sub.add_parser("opencode-server", help="解析 opencode 并通过本地 HTTP NDJSON relay 提供给其他程序")
     _common(relay)

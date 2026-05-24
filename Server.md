@@ -1,8 +1,8 @@
-﻿# RKPP Server 使用说明
+# RKPP Server 使用说明
 
 ## 1. 功能概览
 
-`opencode-server` 模式延续自旧版本；Ver2.0 主要对应当前仓库中的项目命名统一、本地离线数据接入，以及 live-decode outer record 修复后的配套说明。
+Ver2.2 保留并增强 `opencode-server` 模式，用于把解析结果通过本地 HTTP relay 暴露给其他程序。
 
 该模式适合：
 
@@ -18,12 +18,6 @@
 3. opcode / schema 解析
 4. 输出 CSV
 5. 同时通过 HTTP 推送摘要事件
-
-Ver2.0 相对旧版本的直接影响是：
-
-- `decoded_packets.csv` 中会多出 `raw_opcode`、`raw_opcode_hex`、`opcode_normalized`、`payload_trailer_len`
-- c2s `0x0001xxxx` 将在 relay / summary 层按低 16 位 opcode 命名
-- `0x013D / 0x013F` 心跳类控制帧现在能得到稳定摘要，不再在离线回放中大量出现伪异常
 
 ---
 
@@ -69,12 +63,6 @@ python .\rkpp_live_tools.py
 
 ```text
 [relay] listening url=http://127.0.0.1:8765 endpoints=/health,/latest,/events
-```
-
-如果默认端口 `8765` 已被本机其他程序占用，Ver2.0 当前会自动顺延尝试后续可用端口，并在日志中输出类似：
-
-```text
-[relay] requested port 8765 unavailable, fallback port=8766
 ```
 
 ---
@@ -170,8 +158,6 @@ http://127.0.0.1:8765/latest?limit=10
 http://127.0.0.1:8765/latest?limit=20
 ```
 
-如果日志显示已回退到其他端口，请把上面的 `8765` 替换成实际监听端口。
-
 ### 6.2 PowerShell 实时订阅
 
 ```powershell
@@ -232,20 +218,13 @@ server 事件和 `opencode_summary.csv` 共用同一个摘要构造逻辑：
 - 想做在线界面：连 `/events`
 - 想拿完整调试上下文：读 `decoded_packets.csv`
 
-如果你要审查 outer record 层的封装问题，优先看 `decoded_packets.csv`，因为新增字段只在这份明细表中保留：
-
-- `raw_opcode`
-- `raw_opcode_hex`
-- `opcode_normalized`
-- `payload_trailer_len`
-
 ---
 
 ## 9. 推荐使用方式
 
-如果你只是自己看 battle 行为，优先用：
+如果你只是自己看协议行为，优先用：
 
-- `battle-analyze`
+- `analyze`
 
 如果你要把结果接给其他程序，优先用：
 

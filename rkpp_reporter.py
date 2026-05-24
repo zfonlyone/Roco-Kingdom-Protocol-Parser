@@ -11,7 +11,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the LICENSE
 # file for more details.
 
-"""战斗实时控制台输出：BattleConsoleReporter。"""
+"""协议实时控制台输出：ProtocolConsoleReporter。"""
 from __future__ import annotations
 
 from enum import Enum, auto
@@ -21,17 +21,17 @@ import rkpp_proto as proto
 from rkpp_io import SessionLogger
 
 
-class BattlePhase(Enum):
+class ProtocolPhase(Enum):
     """显式战斗阶段状态机。"""
     WAITING_PAIR   = auto()  # 等待对位信息 (inner390)
     WAITING_ROSTER = auto()  # 已收到 pair，等待 1316 + 131A
     ACTIVE         = auto()  # 战斗进行中
 
 
-class BattleConsoleReporter:
+class ProtocolConsoleReporter:
     def __init__(self, *, logger: SessionLogger) -> None:
         self.logger = logger
-        self._phase = BattlePhase.WAITING_PAIR
+        self._phase = ProtocolPhase.WAITING_PAIR
         self.opening_pair:    dict[str, Any] | None       = None
         self.opening_1316:    list[dict[str, Any]] | None = None
         self.opening_131a:    list[dict[str, Any]] | None = None
@@ -121,8 +121,8 @@ class BattleConsoleReporter:
             self._emit(ri, "当前对位已清空")
         else:
             self.opening_pair = detail
-            if self._phase == BattlePhase.WAITING_PAIR:
-                self._phase = BattlePhase.WAITING_ROSTER
+            if self._phase == ProtocolPhase.WAITING_PAIR:
+                self._phase = ProtocolPhase.WAITING_ROSTER
             fn = (detail.get("friendly") or {}).get("name") or fp
             en = (detail.get("enemy")   or {}).get("name") or ep
             self._emit(ri, f"首发对位建立: {fn} vs {en}")
@@ -153,7 +153,7 @@ class BattleConsoleReporter:
         wrappers = d.get("wrappers") or []
         if self.opening_131a is None and len(wrappers) >= 2:
             self.opening_131a = wrappers
-        if self._phase == BattlePhase.ACTIVE:
+        if self._phase == ProtocolPhase.ACTIVE:
             parts = [f"回合开始: round={d.get('round')}"]
             if d.get("state_type") is not None:
                 parts.append(f"state_type={d.get('state_type')}")
@@ -278,7 +278,7 @@ class BattleConsoleReporter:
         ws = d.get("wrappers") or []
         if ws:
             self._emit(ri, f"回合流通知: wrappers={len(ws)}")
-            if self._phase == BattlePhase.ACTIVE:
+            if self._phase == ProtocolPhase.ACTIVE:
                 self._emit_snapshot(ri, ws)
 
     # ------------------------------------------------------------------
@@ -286,7 +286,7 @@ class BattleConsoleReporter:
     # ------------------------------------------------------------------
 
     def _maybe_emit_battle_start(self, ri: int) -> None:
-        if self._phase == BattlePhase.ACTIVE:
+        if self._phase == ProtocolPhase.ACTIVE:
             return
         if self.opening_1316 is None or self.opening_131a is None:
             return
@@ -295,7 +295,7 @@ class BattleConsoleReporter:
             return
         self.active_friendly_slot = int(ff.get("slot") or 0)
         self.active_enemy_slot    = int(ef.get("slot") or 0)
-        self._phase = BattlePhase.ACTIVE
+        self._phase = ProtocolPhase.ACTIVE
 
         self._emit(ri, f"战斗开始: 我方 {ff.get('name')}(slot={ff.get('slot')}) vs 敌方 {ef.get('name')}(slot={ef.get('slot')})")
         vis_enemy   = [it for it in self.opening_1316 if self._slot_key(it) == self.active_enemy_slot]
@@ -356,7 +356,7 @@ class BattleConsoleReporter:
     # ------------------------------------------------------------------
 
     def _emit(self, ri: int, text: str) -> None:
-        self.logger.log(f"[battle][row {ri}] {text}")
+        self.logger.log(f"[protocol][row {ri}] {text}")
 
     def _fmt_skill(self, d: dict[str, Any]) -> str:
         sid = d.get("skill_id")
@@ -404,7 +404,7 @@ class BattleConsoleReporter:
         return int(slot) if slot is not None else -1
 
     def _reset_battle_state(self) -> None:
-        self._phase = BattlePhase.WAITING_PAIR
+        self._phase = ProtocolPhase.WAITING_PAIR
         self.opening_pair = None
         self.opening_1316 = None
         self.opening_131a = None

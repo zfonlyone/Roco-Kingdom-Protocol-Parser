@@ -1,4 +1,7 @@
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -11,6 +14,10 @@ venv/
 env/
 dist/
 build/
+runs/
+Rec.md
+key.txt
+*.tmp
 *.log
 !Update.log
 *.pcap

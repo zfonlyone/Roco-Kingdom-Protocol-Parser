@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 MAGIC = b"\x33\x66"
 FIXED_HDR_LEN = 21
+FIXED_AES_IV = bytes(range(16))
 
 # BE21 合法 cmd 范围，用于帧头校验以减少假 magic 命中。
 _KNOWN_CMD_RANGE = range(0x0001, 0x8000)
@@ -113,6 +114,40 @@ def decrypt_4013_body(key: bytes, body: bytes) -> tuple[bytes, bytes]:
     if len(ct) % 16 != 0:
         raise ValueError("0x4013 body[16:] 不是 16 字节对齐")
     return iv, AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+
+
+def decrypt_4013_body_candidates(key: bytes, body: bytes) -> list[tuple[str, bytes, bytes, bytes]]:
+    """返回 0x4013 可能的明文候选：(mode, iv, cipher, plain)。"""
+    if len(body) < 16:
+        raise ValueError("0x4013 body 长度不足，无法解密")
+
+    out: list[tuple[str, bytes, bytes, bytes]] = []
+    errors: list[str] = []
+
+    if len(body) % 16 == 0:
+        try:
+            out.append((
+                "fixed_iv",
+                FIXED_AES_IV,
+                body,
+                AES.new(key, AES.MODE_CBC, FIXED_AES_IV).decrypt(body),
+            ))
+        except ValueError as exc:
+            errors.append(f"fixed_iv:{exc}")
+
+    if len(body) >= 32:
+        iv = body[:16]
+        ct = body[16:]
+        if len(ct) % 16 == 0:
+            try:
+                out.append(("embedded_iv", iv, ct, AES.new(key, AES.MODE_CBC, iv).decrypt(ct)))
+            except ValueError as exc:
+                errors.append(f"embedded_iv:{exc}")
+
+    if not out:
+        detail = "; ".join(errors) if errors else "no aligned AES candidate"
+        raise ValueError(detail)
+    return out
 
 
 def packet_has_target_port(packet, port: int) -> bool:

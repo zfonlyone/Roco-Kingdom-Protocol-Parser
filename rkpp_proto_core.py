@@ -693,6 +693,7 @@ def _parse_record_v14(body: bytes, common: dict[str, Any]) -> dict[str, Any] | N
         "req_seq": req_seq,
         "payload_len": len(payload),
         "payload_trailer_len": trailer_len,
+        "payload_hex": payload.hex(),
         "payload_format": payload_format,
         "special_payload": special_payload,
         "root": root,
@@ -723,6 +724,7 @@ def _parse_record_live_s2c(body: bytes, common: dict[str, Any]) -> dict[str, Any
         "magic_hex": "0x55AA",
         "payload_len": len(payload),
         "payload_trailer_len": trailer_len,
+        "payload_hex": payload.hex(),
         "payload_format": payload_format,
         "special_payload": special_payload,
         "root": root,
@@ -760,6 +762,46 @@ def _parse_record_live_c2s(body: bytes, common: dict[str, Any]) -> dict[str, Any
         "req_seq": req_seq,
         "payload_len": len(payload),
         "payload_trailer_len": trailer_len,
+        "payload_hex": payload.hex(),
+        "payload_format": payload_format,
+        "special_payload": special_payload,
+        "root": root,
+    }
+
+
+def _parse_record_live_c2s_alt_7ca2(body: bytes, common: dict[str, Any]) -> dict[str, Any] | None:
+    if common["direction"] != "c2s" or len(body) < 14 or body[8:10] != b"\x7c\xa2":
+        return None
+    prefix_u32 = int.from_bytes(body[0:4], "big")
+    raw_opcode = int.from_bytes(body[4:8], "big")
+    if not _is_probable_live_c2s_raw_opcode(raw_opcode):
+        return None
+    opcode, normalized = normalize_c2s_opcode(raw_opcode)
+    req_seq = int.from_bytes(body[10:14], "big")
+    raw_payload = body[14:]
+    trailer_len = tsf4g_trailer_len(raw_payload)
+    payload = strip_tsf4g_padding(raw_payload)
+    root, payload_format, special_payload = _build_payload_root(opcode, payload)
+    return {
+        **common,
+        "record_type": "business",
+        "transport_kind": "tgcp_data",
+        "transport_layout": "tgcp_4013_live_c2s_alt_7ca2",
+        "transport_seq": prefix_u32,
+        "prefix_u32": prefix_u32,
+        "prefix_u32_hex": f"0x{prefix_u32:08X}",
+        "opcode": opcode,
+        "opcode_hex": f"0x{opcode:04X}",
+        "raw_opcode": raw_opcode,
+        "raw_opcode_hex": f"0x{raw_opcode:08X}",
+        "opcode_normalized": normalized,
+        "magic": 0x7CA2,
+        "magic_hex": "0x7CA2",
+        "format": "c2s_alt_7ca2",
+        "req_seq": req_seq,
+        "payload_len": len(payload),
+        "payload_trailer_len": trailer_len,
+        "payload_hex": payload.hex(),
         "payload_format": payload_format,
         "special_payload": special_payload,
         "root": root,
@@ -805,6 +847,7 @@ def parse_record(packet: dict[str, Any]) -> dict[str, Any] | None:
         _parse_record_v14(body, common)
         or _parse_record_live_s2c(body, common)
         or _parse_record_live_c2s(body, common)
+        or _parse_record_live_c2s_alt_7ca2(body, common)
         or _parse_record_live_c2s_short_heartbeat(body, common)
     )
     if record is None and common["direction"] == "c2s" and len(body) >= 8:

@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 import rkpp_analyzer as analyzer
-from rkpp_reporter import BattleConsoleReporter
+from rkpp_reporter import ProtocolConsoleReporter
 
 
 class DummyLogger:
@@ -81,7 +81,7 @@ class AnalyzerDispatchTests(unittest.TestCase):
 
     def test_reporter_handles_schema_decoded_simple_opcode(self) -> None:
         logger = DummyLogger()
-        reporter = BattleConsoleReporter(logger=logger)  # type: ignore[arg-type]
+        reporter = ProtocolConsoleReporter(logger=logger)  # type: ignore[arg-type]
 
         reporter.handle(7, {}, {
             "record": {
