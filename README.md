@@ -1,22 +1,16 @@
 # 洛克王国协议解析器
 
-**项目名称：** Rock Kingdom Protocol Parser
+**项目名称：** PPKR
 **项目简称：** RKPP
-**版本：** Rock Kingdom Protocol Parser-Ver2.2(Notgedrungen)
+**版本：** PPKR-Ver2.2(Notgedrungen)
 
 ---
 
 ## 项目简介
 
-RKPP 是一个用于学习、研究和分析洛克王国协议数据结构、字段语义、报文格式及解码流程的开源项目。
-
-本项目面向协议研究、数据结构理解、网络数据分析、教学示例、互操作性研究与安全研究，提供可审阅、可修改、可复现的参考实现。Ver2.2 重点适配 2026-05 新版本协议数据、RocoMITMServer Ver2.1 的 protobuf/schema 解读逻辑，以及新版 0x4013 报文解析链路。
 
 ---
 
-## 讨论群号
-
-QQ：180106447
 
 ## 当前能力
 
