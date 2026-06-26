@@ -15,6 +15,9 @@ import rkpp_codec as proto_codec
 
 MessageResolver = Callable[[str], dict | None]
 
+DEFAULT_MESSAGE_RECURSION_LIMIT = 100
+DEFAULT_FLATTENED_CANDIDATE_DEPTH = 3
+
 
 @dataclass(frozen=True)
 class DecodeResult:
@@ -57,10 +60,17 @@ def decode_opcode_payload(
     payload: bytes,
     resolve_message: MessageResolver,
     *,
-    max_depth: int = 3,
+    max_depth: int = DEFAULT_MESSAGE_RECURSION_LIMIT,
+    flattened_max_depth: int = DEFAULT_FLATTENED_CANDIDATE_DEPTH,
 ) -> DecodeResult:
     best: DecodeResult | None = None
-    for candidate in _protobuf_candidates(schema, payload, resolve_message, max_depth=max_depth):
+    for candidate in _protobuf_candidates(
+        schema,
+        payload,
+        resolve_message,
+        max_depth=max_depth,
+        flattened_max_depth=flattened_max_depth,
+    ):
         if best is None or _candidate_score(candidate) > _candidate_score(best):
             best = candidate
         if _is_strong_complete(candidate):
@@ -97,12 +107,17 @@ def _protobuf_candidates(
     resolve_message: MessageResolver,
     *,
     max_depth: int,
+    flattened_max_depth: int,
 ) -> Iterable[DecodeResult]:
     yield from _scan_schema("schema", schema, payload, resolve_message, max_depth=max_depth)
     yield from _mixed_parent_message_candidates("schema", schema, payload, resolve_message, max_depth=max_depth)
     yield from _message_continuation_candidates("schema", schema, payload, resolve_message, max_depth=max_depth)
     yield from _parent_prefix_flattened_candidates("schema", schema, payload, resolve_message, max_depth=max_depth)
-    for source, nested in _nested_message_candidates(schema, resolve_message, max_depth=max_depth):
+    for source, nested in _nested_message_candidates(
+        schema,
+        resolve_message,
+        max_depth=flattened_max_depth,
+    ):
         yield from _scan_schema(source, nested, payload, resolve_message, max_depth=max_depth)
         yield from _implicit_schema_candidates(source, nested, payload, resolve_message, max_depth=max_depth)
 
@@ -395,23 +410,12 @@ def _decode_once(
     start: int,
     max_depth: int,
 ) -> tuple[dict, int, int, int]:
-    message_decoder = None
-    if max_depth > 0:
-        def message_decoder(sub_schema: dict, raw: bytes, resolver: proto_codec.RefResolver | None) -> dict:
-            resolved = resolver or resolve_message
-            return decode_opcode_payload(
-                sub_schema,
-                raw,
-                resolved,
-                max_depth=max_depth - 1,
-            ).decoded
-
     return proto_codec.decode_payload_once(
         schema,
         payload,
         resolve_message,
         start=start,
-        decode_message=message_decoder,
+        decode_message=_message_decoder(resolve_message, max_depth=max_depth),
     )
 
 
@@ -445,17 +449,33 @@ def _message_decoder(
     *,
     max_depth: int,
 ) -> proto_codec.MessageDecoder | None:
-    if max_depth <= 0:
-        return None
-
     def decoder(sub_schema: dict, raw: bytes, resolver: proto_codec.RefResolver | None) -> dict:
+        if max_depth <= 0:
+            return {
+                "_unknown": [
+                    {
+                        "reason": "max_depth_exceeded",
+                        "value": bytes(raw).hex(),
+                    }
+                ]
+            }
         resolved = resolver or resolve_message
-        return decode_opcode_payload(
+        decoded, consumed, _field_count, _unknown_top = proto_codec.decode_payload_once(
             sub_schema,
             raw,
             resolved,
-            max_depth=max_depth - 1,
-        ).decoded
+            start=0,
+            decode_message=_message_decoder(resolved, max_depth=max_depth - 1),
+        )
+        if consumed < len(raw):
+            decoded = dict(decoded)
+            unknowns = list(decoded.get("_unknown") or [])
+            unknowns.append({
+                "reason": "trailing_bytes",
+                "value": bytes(raw[consumed:]).hex(),
+            })
+            decoded["_unknown"] = unknowns
+        return decoded
 
     return decoder
 
@@ -867,7 +887,7 @@ def _make_result(
         payload_len=payload_len,
         matched_keys=matched,
         unknown_top=unknown_top,
-        unknown_recursive=count_unknowns(decoded),
+        unknown_recursive=unknown_top + count_unknowns(decoded),
     )
 
 
@@ -878,10 +898,10 @@ def _candidate_score(candidate: DecodeResult) -> tuple[int, int, int, int, int, 
     return (
         1 if candidate.complete_without_unknowns else 0,
         1 if candidate.consumed_all else 0,
-        -candidate.unknown_recursive,
         source_priority,
-        -candidate.start,
         candidate.matched_keys,
+        -candidate.unknown_recursive,
+        -candidate.start,
     )
 
 

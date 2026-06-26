@@ -253,10 +253,10 @@ def decode_payload(
 ) -> dict:
     """根据 schema 解码 payload。
 
-    - schema=None 时退化为"扫描所有字段, 不做名字映射", 结果以 `f<N>` 为键
+    - schema=None 时退化为"扫描所有字段, 不做名字映射", 结果以 `field_<N>` 为键
     - auto_skip_prefix: 若首字节不像合法 pb tag, 跳过 1~2 字节再试
       (服务端 0x02A5 / 0x03DD 有此现象)
-    - 未在 schema 中声明的字段进入 result['_unknown'] 列表
+    - 未在 schema 中声明的字段以 `field_<N>` 形式保留 wire 与 value。
     """
     if auto_skip_prefix and payload:
         best = None
@@ -286,6 +286,57 @@ def decode_payload(
     )[0]
 
 
+def _add_decoded_value(out: dict[str, Any], name: str, value: Any) -> None:
+    if name not in out:
+        out[name] = value
+        return
+    if not isinstance(out[name], list):
+        out[name] = [out[name]]
+    out[name].append(value)
+
+
+def _try_decode_unknown_message(raw: bytes) -> dict[str, Any] | None:
+    if not raw or not is_valid_tag_byte(raw[0]):
+        return None
+    try:
+        decoded, consumed, _field_count, _unknown_count = _decode_payload_once(None, raw)
+    except Exception:
+        return None
+    if consumed < len(raw) or not decoded:
+        return None
+    return decoded
+
+
+def _decode_unknown_value(
+    wire_type: int,
+    raw: Any,
+    *,
+    reason: str | None = None,
+    expected_wire: int | None = None,
+) -> Any:
+    if wire_type in (WIRE_VARINT, WIRE_FIXED32, WIRE_FIXED64) and reason is None:
+        return raw
+
+    if isinstance(raw, (bytes, bytearray)):
+        data = bytes(raw)
+        value: dict[str, Any] = {
+            "wire": wire_type,
+            "len": len(data),
+            "hex": data.hex(),
+        }
+        nested = _try_decode_unknown_message(data) if wire_type == WIRE_LEN else None
+        if nested is not None:
+            value["decoded"] = nested
+    else:
+        value = {"wire": wire_type, "value": raw}
+
+    if reason:
+        value["reason"] = reason
+    if expected_wire is not None:
+        value["expected_wire"] = expected_wire
+    return value
+
+
 def _decode_payload_once(
     schema: dict | None,
     payload: bytes,
@@ -297,7 +348,7 @@ def _decode_payload_once(
     fields = (schema or {}).get("fields") or []
     by_no = {f["no"]: f for f in fields}
     out: dict[str, Any] = {}
-    unknowns: list[dict] = []
+    unknown_count = 0
     field_count = 0
 
     i = start
@@ -314,11 +365,8 @@ def _decode_payload_once(
             break
         f = by_no.get(fn)
         if f is None:
-            unknowns.append({
-                "no": fn,
-                "wire": wt,
-                "value": raw.hex() if isinstance(raw, (bytes, bytearray)) else raw,
-            })
+            _add_decoded_value(out, f"field_{fn}", _decode_unknown_value(wt, raw))
+            unknown_count += 1
             continue
         field_count += 1
         # 与原 rsp_decoder._render 一致: 跳过 wire-type 不匹配的字段
@@ -326,29 +374,38 @@ def _decode_payload_once(
         try:
             expected_wt = wire_type_for(f["type"])
         except ValueError:
-            unknowns.append({"no": fn, "wire": wt, "value": raw, "reason": "bad_schema_type"})
+            _add_decoded_value(
+                out,
+                f.get("name") or f"field_{fn}",
+                _decode_unknown_value(wt, raw, reason="bad_schema_type"),
+            )
+            unknown_count += 1
             continue
         if wt != expected_wt:
             if f.get("repeated") and wt == WIRE_LEN and _is_packable_type(f["type"]):
                 try:
                     vals = _decode_packed_values(f, raw)
                 except Exception:
-                    unknowns.append({
-                        "no": fn,
-                        "wire": wt,
-                        "value": raw.hex() if isinstance(raw, (bytes, bytearray)) else raw,
-                        "reason": "bad_packed_repeated",
-                    })
+                    _add_decoded_value(
+                        out,
+                        f.get("name") or f"field_{fn}",
+                        _decode_unknown_value(wt, raw, reason="bad_packed_repeated"),
+                    )
+                    unknown_count += 1
                     continue
                 out.setdefault(f["name"], []).extend(vals)
                 continue
-            unknowns.append({
-                "no": fn,
-                "wire": wt,
-                "value": raw.hex() if isinstance(raw, (bytes, bytearray)) else raw,
-                "reason": "wire_type_mismatch",
-                "expected_wire": expected_wt,
-            })
+            _add_decoded_value(
+                out,
+                f.get("name") or f"field_{fn}",
+                _decode_unknown_value(
+                    wt,
+                    raw,
+                    reason="wire_type_mismatch",
+                    expected_wire=expected_wt,
+                ),
+            )
+            unknown_count += 1
             continue
         decoded = _decode_value(f, wt, raw, resolve_message, decode_message)
         if f.get("repeated"):
@@ -357,9 +414,7 @@ def _decode_payload_once(
             # first-wins (与原 rsp_decoder 一致)
             out.setdefault(f["name"], decoded)
 
-    if unknowns:
-        out["_unknown"] = unknowns
-    return out, i, field_count, len(unknowns)
+    return out, i, field_count, unknown_count
 
 
 def decode_payload_once(

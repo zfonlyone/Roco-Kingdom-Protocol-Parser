@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import logging
+import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 try:
     from Crypto.Cipher import AES
@@ -32,17 +34,25 @@ logger = logging.getLogger(__name__)
 
 MAGIC = b"\x33\x66"
 FIXED_HDR_LEN = 21
-FIXED_AES_IV = bytes(range(16))
+RKPP_IVDECODER_MODE = "Ivdecoder"
+RKPP_IVDECODER_AES_IV = bytes(range(16))
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_KEY_DIR = SCRIPT_DIR / "Key"
+SETTINGS_PATH = SCRIPT_DIR / "rkpp_settings.json"
 
 # BE21 合法 cmd 范围，用于帧头校验以减少假 magic 命中。
 _KNOWN_CMD_RANGE = range(0x0001, 0x8000)
 
 # 防止 seen_acks 无限增长。
-_MAX_SEEN_ACKS = 256
+RKPP_MAX_SEEN_ACKS = 256
 
 # 防止连续流缓存与乱序段缓存无限增长。
-_MAX_BUFFER_SIZE = 16 * 1024 * 1024
-_MAX_PENDING_BYTES = 8 * 1024 * 1024
+RKPP_MAX_BUFFER_SIZE = 16 * 1024 * 1024
+RKPP_MAX_PENDING_BYTES = 8 * 1024 * 1024
+
+_MAX_SEEN_ACKS = RKPP_MAX_SEEN_ACKS
+_MAX_BUFFER_SIZE = RKPP_MAX_BUFFER_SIZE
+_MAX_PENDING_BYTES = RKPP_MAX_PENDING_BYTES
 
 
 def printable_ascii(blob: bytes) -> str | None:
@@ -98,56 +108,51 @@ def load_key_from_file(path: str | Path) -> bytes | None:
     return None
 
 
-def write_key_file(path: str | Path, key: bytes, flow_id: str) -> None:
-    Path(path).write_text(
+def _key_record_text(key: bytes, flow_id: str, captured_at: str) -> str:
+    return (
         f"key_hex={key.hex()}\nkey_ascii={printable_ascii(key) or '<non-ascii>'}\n"
-        f"flow={flow_id}\ncaptured_at={now_text()}\n",
+        f"flow={flow_id}\ncaptured_at={captured_at}\n"
+    )
+
+
+def write_key_file(path: str | Path, key: bytes, flow_id: str, *, captured_at: str | None = None) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        _key_record_text(key, flow_id, captured_at or now_text()),
         encoding="utf-8",
     )
 
 
+def default_key_dir() -> Path:
+    return DEFAULT_KEY_DIR
+
+
+def latest_key_path(key_dir: str | Path | None = None) -> Path:
+    return Path(key_dir or DEFAULT_KEY_DIR) / "latest.key"
+
+
+def load_latest_key(key_dir: str | Path | None = None) -> bytes | None:
+    return load_key_from_file(latest_key_path(key_dir))
+
+
+def write_key_store(key: bytes, flow_id: str, key_dir: str | Path | None = None) -> tuple[Path, Path]:
+    key_dir = Path(key_dir or DEFAULT_KEY_DIR)
+    key_dir.mkdir(parents=True, exist_ok=True)
+    captured_at = now_text()
+    text = _key_record_text(key, flow_id, captured_at)
+    latest_path = latest_key_path(key_dir)
+    latest_path.write_text(text, encoding="utf-8")
+    return latest_path, latest_path
+
+
 def decrypt_4013_body(key: bytes, body: bytes) -> tuple[bytes, bytes]:
-    if len(body) < 32:
-        raise ValueError("0x4013 body 长度不足，无法拆出 IV + 密文")
-    iv = body[:16]
-    ct = body[16:]
-    if len(ct) % 16 != 0:
-        raise ValueError("0x4013 body[16:] 不是 16 字节对齐")
-    return iv, AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
-
-
-def decrypt_4013_body_candidates(key: bytes, body: bytes) -> list[tuple[str, bytes, bytes, bytes]]:
-    """返回 0x4013 可能的明文候选：(mode, iv, cipher, plain)。"""
+    """Decrypt 0x4013 with the current Ivdecoder layout."""
     if len(body) < 16:
         raise ValueError("0x4013 body 长度不足，无法解密")
-
-    out: list[tuple[str, bytes, bytes, bytes]] = []
-    errors: list[str] = []
-
-    if len(body) % 16 == 0:
-        try:
-            out.append((
-                "fixed_iv",
-                FIXED_AES_IV,
-                body,
-                AES.new(key, AES.MODE_CBC, FIXED_AES_IV).decrypt(body),
-            ))
-        except ValueError as exc:
-            errors.append(f"fixed_iv:{exc}")
-
-    if len(body) >= 32:
-        iv = body[:16]
-        ct = body[16:]
-        if len(ct) % 16 == 0:
-            try:
-                out.append(("embedded_iv", iv, ct, AES.new(key, AES.MODE_CBC, iv).decrypt(ct)))
-            except ValueError as exc:
-                errors.append(f"embedded_iv:{exc}")
-
-    if not out:
-        detail = "; ".join(errors) if errors else "no aligned AES candidate"
-        raise ValueError(detail)
-    return out
+    if len(body) % 16 != 0:
+        raise ValueError("0x4013 body 不是 16 字节对齐")
+    return RKPP_IVDECODER_AES_IV, AES.new(key, AES.MODE_CBC, RKPP_IVDECODER_AES_IV).decrypt(body)
 
 
 def packet_has_target_port(packet, port: int) -> bool:
@@ -177,9 +182,60 @@ def flow_key_from_packet(packet, port: int) -> tuple[str, str, int, str, int, st
     return None
 
 
-def list_ifaces() -> None:
-    for iface in conf.ifaces.values():
-        print(f"{iface.name}\t{getattr(iface, 'description', '')}")
+def load_settings(path: str | Path | None = None) -> dict[str, Any]:
+    path = Path(path or SETTINGS_PATH)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load settings %s: %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(settings: dict[str, Any], path: str | Path | None = None) -> Path:
+    path = Path(path or SETTINGS_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def get_default_iface(path: str | Path | None = None) -> str | None:
+    value = load_settings(path).get("default_iface")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def set_default_iface(iface: str, path: str | Path | None = None) -> Path:
+    iface = iface.strip()
+    if not iface:
+        raise ValueError("interface name cannot be empty")
+    settings = load_settings(path)
+    settings["default_iface"] = iface
+    return save_settings(settings, path)
+
+
+def iter_ifaces() -> list[tuple[str, str]]:
+    return [
+        (iface.name, getattr(iface, "description", ""))
+        for iface in conf.ifaces.values()
+    ]
+
+
+def list_ifaces(default_iface: str | None = None) -> None:
+    default_iface = default_iface if default_iface is not None else get_default_iface()
+    found_default = False
+    for name, description in iter_ifaces():
+        suffix = ""
+        if default_iface and name == default_iface:
+            suffix = "\t[default]"
+            found_default = True
+        print(f"{name}\t{description}{suffix}")
+    if default_iface and not found_default:
+        print(f"{default_iface}\t[default, not currently listed]")
 
 
 @dataclass
@@ -256,6 +312,8 @@ class DirectionState:
     _next_contig_seq: int | None = None
     _pending: dict[int, bytes] = field(default_factory=dict)
     _pending_bytes: int = 0
+    dropped_pending_segments: int = 0
+    trimmed_buffers: int = 0
 
     def feed(self, seq: int, payload: bytes) -> list[Be21Packet]:
         """把 TCP 段按 seq 重组为连续字节流，再交给 BE21 解析器。"""
@@ -379,6 +437,7 @@ class DirectionState:
             farthest_seq = max(self._pending)
             dropped = self._pending.pop(farthest_seq)
             self._pending_bytes -= len(dropped)
+            self.dropped_pending_segments += 1
             logger.warning(
                 "DirectionState[%s] pending cache exceeded %d bytes, dropping segment at seq=%d",
                 self.direction,
@@ -389,12 +448,11 @@ class DirectionState:
     def _drain_pending(self) -> None:
         assert self._next_contig_seq is not None
 
-        while True:
-            ready = [pending_seq for pending_seq in self._pending if pending_seq <= self._next_contig_seq]
-            if not ready:
+        while self._pending:
+            seq = min(self._pending)
+            if seq > self._next_contig_seq:
                 return
 
-            seq = min(ready)
             payload = self._pending.pop(seq)
             self._pending_bytes -= len(payload)
 
@@ -413,6 +471,7 @@ class DirectionState:
             self.direction,
             _MAX_BUFFER_SIZE,
         )
+        self.trimmed_buffers += 1
         desired = _MAX_BUFFER_SIZE // 2
         if self.parse_offset > 0:
             trim = min(self.parse_offset, max(0, len(self.buffer) - desired))
@@ -431,7 +490,7 @@ class DirectionState:
 class _BoundedAckSet:
     """有界去重集合，淘汰最早的条目防止内存泄漏。"""
 
-    def __init__(self, maxsize: int = _MAX_SEEN_ACKS) -> None:
+    def __init__(self, maxsize: int = RKPP_MAX_SEEN_ACKS) -> None:
         self._data: OrderedDict[tuple[int, str], None] = OrderedDict()
         self._maxsize = maxsize
 

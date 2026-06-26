@@ -13,21 +13,26 @@
 
 """RKPP runtime data access.
 
-运行时只读取本项目 Data/ 下的本地索引文件；构建索引由 tools/build_data_bundle.py
-离线完成。为兼容旧代码，仍保留 CSV 兜底和 get_maps() 接口。
+Release builds use ``rkpp_data.sqlite`` at the project root. Payload columns are
+MessagePack blobs so hot lookups do not need to parse the old multi-file JSON
+bundle. The old ``Data/`` JSON layout is kept as a maintenance fallback.
 """
 from __future__ import annotations
 
 import csv
 import json
 import logging
+import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Callable
 
+import msgpack
+
 logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DB = SCRIPT_DIR / "rkpp_data.sqlite"
 DATA_DIR = SCRIPT_DIR / "Data"
 
 ATTR_CSV = DATA_DIR / "Attr.csv"
@@ -45,6 +50,8 @@ MONSTER_SKILLBANK_MAP_JSON = DATA_DIR / "monster_skillbank_map.json"
 SPECIAL_MOVE_MAP_JSON = DATA_DIR / "special_move_map.json"
 OPCODE_PB_MAP_JSON = DATA_DIR / "opcode_pb_map.json"
 PB_MESSAGE_INDEX_JSON = DATA_DIR / "pb_message_index.json"
+OPCODE_JSON = DATA_DIR / "opcode.json"
+PROTO_SCHEMA_JSON = DATA_DIR / "proto_schema.json"
 DATA_MANIFEST_JSON = DATA_DIR / "data_manifest.json"
 
 _JSON_PATHS: dict[str, Path] = {
@@ -59,7 +66,21 @@ _JSON_PATHS: dict[str, Path] = {
     "special_move_meta": SPECIAL_MOVE_MAP_JSON,
     "opcode_pb_meta": OPCODE_PB_MAP_JSON,
     "pb_message_meta": PB_MESSAGE_INDEX_JSON,
+    "opcode_map": OPCODE_JSON,
+    "proto_schema": PROTO_SCHEMA_JSON,
     "manifest": DATA_MANIFEST_JSON,
+}
+
+_ENTITY_KIND_BY_BUNDLE_KEY = {
+    "attr_meta": "attr",
+    "skill_meta": "skill",
+    "buff_meta": "buff",
+    "buffbase_meta": "buffbase",
+    "pet_meta": "pet",
+    "monster_meta": "monster",
+    "pet_skill_meta": "pet_skill",
+    "monster_skillbank_meta": "monster_skillbank",
+    "special_move_meta": "special_move",
 }
 
 
@@ -137,21 +158,168 @@ def _name_map_from_meta(meta: dict[int, dict[str, Any]]) -> dict[int, str]:
 
 _json_cache: dict[str, Any] | None = None
 _maps_cache: dict[str, dict[int, str]] | None = None
+_sqlite_conn: sqlite3.Connection | None = None
+_sqlite_available: bool | None = None
 _lock = threading.RLock()
 
 _MetaNormalizer = Callable[[int | None], int | None]
+
+
+def _unpack_payload(payload: bytes | memoryview | None) -> Any:
+    if payload is None:
+        return None
+    return msgpack.unpackb(bytes(payload), raw=False, strict_map_key=False)
+
+
+def _connect_sqlite() -> sqlite3.Connection | None:
+    global _sqlite_conn, _sqlite_available
+    if _sqlite_available is False:
+        return None
+    if not DATA_DB.exists():
+        _sqlite_available = False
+        return None
+    if _sqlite_conn is None:
+        try:
+            uri = f"file:{DATA_DB.as_posix()}?mode=ro"
+            _sqlite_conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            _sqlite_conn.row_factory = sqlite3.Row
+            _sqlite_available = True
+        except sqlite3.Error as exc:
+            logger.warning("Failed to open sqlite data bundle %s: %s", DATA_DB, exc)
+            _sqlite_available = False
+            _sqlite_conn = None
+    return _sqlite_conn
+
+
+def _sqlite_payload(sql: str, params: tuple[Any, ...]) -> Any:
+    conn = _connect_sqlite()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.Error as exc:
+        logger.warning("Failed sqlite data query: %s", exc)
+        return None
+    if row is None:
+        return None
+    return _unpack_payload(row["payload_msgpack"])
+
+
+def _sqlite_int_payload(table: str, id_column: str, value: int | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    payload = _sqlite_payload(f"SELECT payload_msgpack FROM {table} WHERE {id_column}=?", (int(value),))
+    return payload if isinstance(payload, dict) else None
+
+
+def _sqlite_entity(kind: str, value: int | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    payload = _sqlite_payload(
+        "SELECT payload_msgpack FROM entity WHERE kind=? AND id=?",
+        (kind, int(value)),
+    )
+    return payload if isinstance(payload, dict) else None
+
+
+def _sqlite_all_entities(kind: str) -> dict[int, dict[str, Any]]:
+    conn = _connect_sqlite()
+    if conn is None:
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for row in conn.execute("SELECT id, payload_msgpack FROM entity WHERE kind=?", (kind,)):
+        payload = _unpack_payload(row["payload_msgpack"])
+        if isinstance(payload, dict):
+            out[int(row["id"])] = payload
+    return out
+
+
+def _sqlite_name_map(kind: str) -> dict[int, str]:
+    conn = _connect_sqlite()
+    if conn is None:
+        return {}
+    out: dict[int, str] = {}
+    for row in conn.execute("SELECT id, name FROM entity WHERE kind=? AND name IS NOT NULL", (kind,)):
+        name = row["name"]
+        if isinstance(name, str) and name:
+            out[int(row["id"])] = name
+    return out
+
+
+def _sqlite_get_meta_value(key: str) -> dict[str, Any] | None:
+    payload = _sqlite_payload("SELECT payload_msgpack FROM meta WHERE key=?", (key,))
+    return payload if isinstance(payload, dict) else None
+
+
+def _sqlite_get_kv(kind: str, key: str = "root") -> dict[str, Any] | None:
+    payload = _sqlite_payload(
+        "SELECT payload_msgpack FROM kv WHERE kind=? AND key=?",
+        (kind, key),
+    )
+    return payload if isinstance(payload, dict) else None
+
+
+def _sqlite_opcode_map() -> dict[str, dict[str, Any]]:
+    conn = _connect_sqlite()
+    if conn is None:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in conn.execute("SELECT opcode, payload_msgpack FROM opcode"):
+        payload = _unpack_payload(row["payload_msgpack"])
+        if isinstance(payload, dict):
+            out[str(int(row["opcode"]))] = payload
+    return out
+
+
+def _sqlite_opcode_pb_map() -> dict[int, dict[str, Any]]:
+    conn = _connect_sqlite()
+    if conn is None:
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for row in conn.execute("SELECT opcode, payload_msgpack FROM opcode_pb"):
+        payload = _unpack_payload(row["payload_msgpack"])
+        if isinstance(payload, dict):
+            out[int(row["opcode"])] = payload
+    return out
+
+
+def _sqlite_pb_message_map() -> dict[str, dict[str, Any]]:
+    conn = _connect_sqlite()
+    if conn is None:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for row in conn.execute("SELECT name, payload_msgpack FROM pb_message"):
+        payload = _unpack_payload(row["payload_msgpack"])
+        if isinstance(payload, dict):
+            out[str(row["name"])] = payload
+    return out
+
+
+def has_sqlite_bundle() -> bool:
+    return _connect_sqlite() is not None
 
 
 def _load_json_bundle() -> dict[str, Any]:
     bundle: dict[str, Any] = {}
     for name, path in _JSON_PATHS.items():
         raw = _read_json_dict(path)
-        if name == "manifest":
-            bundle[name] = raw
-        elif name == "pb_message_meta":
+        if name in {"manifest", "pb_message_meta", "opcode_map", "proto_schema"}:
             bundle[name] = raw
         else:
             bundle[name] = _int_keyed_meta(raw)
+    return bundle
+
+
+def _load_sqlite_bundle() -> dict[str, Any]:
+    bundle: dict[str, Any] = {
+        "manifest": _sqlite_get_meta_value("manifest") or {},
+        "pb_message_meta": _sqlite_pb_message_map(),
+        "opcode_pb_meta": _sqlite_opcode_pb_map(),
+        "opcode_map": _sqlite_opcode_map(),
+        "proto_schema": _sqlite_get_kv("proto_schema") or {"messages": {}, "enums": {}},
+    }
+    for bundle_key, kind in _ENTITY_KIND_BY_BUNDLE_KEY.items():
+        bundle[bundle_key] = _sqlite_all_entities(kind)
     return bundle
 
 
@@ -161,11 +329,20 @@ def get_bundle() -> dict[str, Any]:
         return _json_cache
     with _lock:
         if _json_cache is None:
-            _json_cache = _load_json_bundle()
+            _json_cache = _load_sqlite_bundle() if has_sqlite_bundle() else _load_json_bundle()
         return _json_cache
 
 
 def _load_all_maps() -> dict[str, dict[int, str]]:
+    if has_sqlite_bundle():
+        pet_map = _sqlite_name_map("pet")
+        pet_map.update(_sqlite_name_map("monster"))
+        return {
+            "attr": _sqlite_name_map("attr"),
+            "pet": pet_map,
+            "skill": _sqlite_name_map("skill"),
+        }
+
     bundle = get_bundle()
     csv_attr = _build_id_name_map(_read_rows(ATTR_CSV), id_field="attr_id")
     csv_pet = _build_id_name_map(_read_rows(PET_CSV), id_field="pet_id")
@@ -215,6 +392,18 @@ def _get_bundle_meta(
     lookup_key = _normalize_lookup_value(value, normalizer=normalizer)
     if lookup_key is None:
         return None
+
+    if has_sqlite_bundle():
+        for bundle_key in bundle_keys:
+            if bundle_key == "opcode_pb_meta":
+                entry = _sqlite_int_payload("opcode_pb", "opcode", lookup_key)
+            else:
+                kind = _ENTITY_KIND_BY_BUNDLE_KEY.get(bundle_key)
+                entry = _sqlite_entity(kind, lookup_key) if kind else None
+            if isinstance(entry, dict):
+                return entry
+        return None
+
     bundle = get_bundle()
     for bundle_key in bundle_keys:
         entry = bundle.get(bundle_key, {}).get(lookup_key)
@@ -256,11 +445,19 @@ def get_attr_name(attr_id: int | None) -> str | None:
 
 
 def get_skill_meta(skill_id: int | None) -> dict[str, Any] | None:
-    return _get_bundle_meta("skill_meta", value=skill_id, normalizer=_normalize_skill_id)
+    return _get_bundle_meta("skill_meta", value=skill_id) or _get_bundle_meta(
+        "skill_meta",
+        value=skill_id,
+        normalizer=_normalize_skill_id,
+    )
 
 
 def get_skill_name(skill_id: int | None) -> str | None:
     return _get_name_from_meta_or_map(
+        "skill_meta",
+        value=skill_id,
+        map_name="skill",
+    ) or _get_name_from_meta_or_map(
         "skill_meta",
         value=skill_id,
         map_name="skill",
@@ -307,18 +504,57 @@ def get_opcode_pb_meta(opcode: int | None) -> dict[str, Any] | None:
 def get_pb_message_meta(name: str | None) -> dict[str, Any] | None:
     if not name:
         return None
+    if has_sqlite_bundle():
+        payload = _sqlite_payload(
+            "SELECT payload_msgpack FROM pb_message WHERE name=?",
+            (name,),
+        )
+        return payload if isinstance(payload, dict) else None
     value = get_bundle().get("pb_message_meta", {}).get(name)
     return value if isinstance(value, dict) else None
 
 
 def get_manifest() -> dict[str, Any]:
+    if has_sqlite_bundle():
+        return _sqlite_get_meta_value("manifest") or {}
     manifest = get_bundle().get("manifest", {})
     return manifest if isinstance(manifest, dict) else {}
 
 
+def get_sqlite_manifest() -> dict[str, Any]:
+    return _sqlite_get_meta_value("sqlite_manifest") or {}
+
+
+def get_opcode_map() -> dict[str, dict[str, Any]]:
+    if has_sqlite_bundle():
+        return _sqlite_opcode_map()
+    opcode_map = get_bundle().get("opcode_map", {})
+    return opcode_map if isinstance(opcode_map, dict) else {}
+
+
+def get_proto_schema() -> dict[str, dict[str, Any]]:
+    if has_sqlite_bundle():
+        return _sqlite_get_kv("proto_schema") or {"messages": {}, "enums": {}}
+    schema = get_bundle().get("proto_schema", {})
+    return schema if isinstance(schema, dict) else {"messages": {}, "enums": {}}
+
+
+def get_blob(name: str) -> bytes | None:
+    conn = _connect_sqlite()
+    if conn is None:
+        path = DATA_DIR / name
+        return path.read_bytes() if path.exists() else None
+    row = conn.execute("SELECT data FROM blob_store WHERE name=?", (name,)).fetchone()
+    return bytes(row["data"]) if row is not None else None
+
+
 def invalidate_cache() -> None:
-    """热重载 / 测试时调用，使下次查询重新读取 Data 目录。"""
-    global _json_cache, _maps_cache
+    """热重载 / 测试时调用，使下次查询重新读取运行时数据。"""
+    global _json_cache, _maps_cache, _sqlite_conn, _sqlite_available
     with _lock:
         _json_cache = None
         _maps_cache = None
+        if _sqlite_conn is not None:
+            _sqlite_conn.close()
+        _sqlite_conn = None
+        _sqlite_available = None

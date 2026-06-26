@@ -28,13 +28,18 @@ import rkpp_proto as proto
 import rkpp_analysis as analysis
 from rkpp_io import CsvSink, SessionLogger, now_text
 from rkpp_network import (Be21Packet, FlowState,
-                           decrypt_4013_body_candidates, flow_key_from_packet,
-                           packet_has_target_port, printable_ascii, write_key_file)
+                           default_key_dir,
+                           decrypt_4013_body, flow_key_from_packet,
+                           RKPP_IVDECODER_MODE,
+                           packet_has_target_port, printable_ascii, write_key_file,
+                           write_key_store)
 
 logger = logging.getLogger(__name__)
 
 # 连续解密失败超过此阈值时发出告警
 _ERROR_ALERT_THRESHOLD = 10
+RKPP_MAX_ACTIVE_FLOWS = 128
+RKPP_FLOW_PRUNE_INTERVAL_PACKETS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -127,21 +132,6 @@ def _summarize_1312(record, _inner):
     return {"detail": proto.extract_1312_round_flow(record)}
 
 
-# Keep hardcoded opcode handling only where it adds semantics beyond schema
-# field-name translation. Other simple handlers fall back to
-# opcode.json/proto_schema.json, including raw field dumps when schema is absent.
-_SEMANTIC_OVERRIDE_OPCODES = {
-    0x0102, 0x01A9, 0x0220,
-    0x130B, 0x130C, 0x1312, 0x1316, 0x131A,
-    0x1322, 0x1324, 0x132C,
-    0x13F3, 0x13F4, 0x13FC,
-}
-_OPCODE_REGISTRY = {
-    op: entry for op, entry in _OPCODE_REGISTRY.items()
-    if op in _SEMANTIC_OVERRIDE_OPCODES
-}
-
-
 @_register_inner(390, "inner390_pair")
 def _summarize_inner390(inner):
     return {"detail": proto.parse_inner390_detail(inner["fields"])}
@@ -211,6 +201,14 @@ _RECORD_ROW_FIELD_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("transport_kind", ("transport_kind",)),
     ("transport_layout", ("transport_layout",)),
     ("transport_seq", ("transport_seq",)),
+    ("ivdecoder_plain_len", ("ivdecoder_plain_len",)),
+    ("ivdecoder_trailer_len", ("ivdecoder_trailer_len",)),
+    ("ivdecoder_trailer_ok", ("ivdecoder_trailer_ok",)),
+    ("ivdecoder_record_offset", ("ivdecoder_record_offset",)),
+    ("ivdecoder_header_hex", ("ivdecoder_header_hex",)),
+    ("ivdecoder_header_magic_hex", ("ivdecoder_header_magic_hex",)),
+    ("ivdecoder_body_length", ("ivdecoder_body_length",)),
+    ("ivdecoder_body_length_matches", ("ivdecoder_body_length_matches",)),
     ("record_len", ("record_len",)),
     ("session_id_hex", ("session_id_hex",)),
     ("sub_id_hex", ("sub_id_hex",)),
@@ -509,11 +507,13 @@ class RkppAnalyzer:
     def __init__(self, *, port: int, logger: SessionLogger, writer: PcapWriter | None,
                  key_file: Path, csv_sink: CsvSink | None,
                  preset_key: bytes | None, stop_after_key: bool,
+                 key_store_dir: Path | None = None,
                  analysis_listener: Any | None = None) -> None:
         self.port = port
         self.session_logger = logger
         self.writer = writer
         self.key_file = key_file
+        self.key_store_dir = key_store_dir or default_key_dir()
         self.csv_sink = csv_sink
         self.preset_key = preset_key
         self.stop_after_key = stop_after_key
@@ -523,6 +523,8 @@ class RkppAnalyzer:
         self.key_hits = 0
         self.decoded_rows = 0
         self.flows: dict[tuple[str, int, str, int], FlowState] = {}
+        self._flow_last_seen: dict[tuple[str, int, str, int], int] = {}
+        self._last_flow_prune_packet = 0
         self.business_frames_seen = 0
         self.parsed_business_records = 0
         self.failed_business_records = 0
@@ -531,6 +533,17 @@ class RkppAnalyzer:
         self._total_errors = 0
         self.listener_errors = 0
         self._error_alerted = False
+
+    def _write_key_outputs(self, key: bytes, flow_id: str) -> tuple[Path, Path]:
+        write_key_file(self.key_file, key, flow_id)
+        return write_key_store(key, flow_id, self.key_store_dir)
+
+    @staticmethod
+    def _key_output_suffix(paths: tuple[Path, Path]) -> str:
+        history_path, latest_path = paths
+        if history_path == latest_path:
+            return f" latest_key={latest_path}"
+        return f" key_file={history_path} latest_key={latest_path}"
 
     # ------------------------------------------------------------------
     # 包入口
@@ -561,13 +574,29 @@ class RkppAnalyzer:
             self.flows[fk] = flow
             self.session_logger.log(f"[flow] new flow={flow.flow_id}")
             if self.preset_key:
-                write_key_file(self.key_file, self.preset_key, flow.flow_id)
+                key_paths = self._write_key_outputs(self.preset_key, flow.flow_id)
                 self.session_logger.log(
                     f"[key] preset key active flow={flow.flow_id} key_hex={self.preset_key.hex()} "
                     f"key_ascii={printable_ascii(self.preset_key) or '<non-ascii>'}"
+                    f"{self._key_output_suffix(key_paths)}"
                 )
+        self._flow_last_seen[fk] = self.packet_count
+        if self.packet_count - self._last_flow_prune_packet >= RKPP_FLOW_PRUNE_INTERVAL_PACKETS:
+            self._prune_inactive_flows()
         for be21 in flow.direction_state(direction).feed(int(packet[TCP].seq), payload):
             self._handle_be21(flow, be21, packet, frame_no)
+
+    def _prune_inactive_flows(self) -> None:
+        self._last_flow_prune_packet = self.packet_count
+        overflow = len(self.flows) - RKPP_MAX_ACTIVE_FLOWS
+        if overflow <= 0:
+            return
+        oldest = sorted(self._flow_last_seen.items(), key=lambda item: item[1])[:overflow]
+        for fk, _last_seen in oldest:
+            flow = self.flows.pop(fk, None)
+            self._flow_last_seen.pop(fk, None)
+            if flow is not None:
+                self.session_logger.log(f"[flow] pruned inactive flow={flow.flow_id}")
 
     def _handle_be21(self, flow: FlowState, be21: Be21Packet, packet, frame_no: int | None) -> None:
         # Key 提取
@@ -576,14 +605,23 @@ class RkppAnalyzer:
             dedupe = (be21.seq, key.hex())
             if dedupe not in flow.seen_acks:
                 flow.seen_acks.add(dedupe)
+                previous_key = flow.key
                 flow.key = key
                 self._consecutive_errors = 0
                 self._error_alerted = False
                 self.key_hits += 1
-                write_key_file(self.key_file, key, flow.flow_id)
+                key_paths = self._write_key_outputs(key, flow.flow_id)
+                if previous_key is None:
+                    key_status = "new"
+                elif previous_key == key:
+                    key_status = "unchanged"
+                else:
+                    key_status = "refreshed"
                 self.session_logger.log(
                     f"[ack_0x1002] flow={flow.flow_id} dir={be21.direction} seq={be21.seq} "
-                    f"key_hex={key.hex()} key_ascii={printable_ascii(key) or '<non-ascii>'}"
+                    f"key_status={key_status} key_hex={key.hex()} "
+                    f"key_ascii={printable_ascii(key) or '<non-ascii>'}"
+                    f"{self._key_output_suffix(key_paths)}"
                 )
                 if self.stop_after_key:
                     self.should_stop = True
@@ -634,40 +672,34 @@ class RkppAnalyzer:
             row["decrypt_status"] = "no_key"
             return row, None
         try:
-            candidates = decrypt_4013_body_candidates(flow.key, be21.body)
+            iv, plain = decrypt_4013_body(flow.key, be21.body)
         except ValueError as exc:
             # 解密失败——可能是 key 错误或数据截断
             self._record_error(f"decrypt_fail:{exc}", be21.seq)
             row["decrypt_status"] = f"decrypt_error:{exc}"
             return row, None
 
-        last_row = row
-        last_error = "parse_unparsed"
-        for mode, iv, cipher, plain in candidates:
-            trial_row = self._build_base_row(flow, be21, packet, frame_no)
-            trial_row.update({
-                "decrypt_status": "ok", "decrypt_mode": mode, "iv_hex": iv.hex(),
-                "cipher_hex": cipher.hex(), "decrypted_body_hex": plain.hex(),
-            })
-            try:
-                parsed_info = self._parse_decrypted(trial_row, flow, be21, packet, frame_no, plain)
-                if parsed_info is None:
-                    last_row = trial_row
-                    last_error = f"parse_unparsed:{mode}:{trial_row.get('decrypt_status')}"
-                    continue
+        trial_row = self._build_base_row(flow, be21, packet, frame_no)
+        trial_row.update({
+            "decrypt_status": "ok", "decrypt_mode": RKPP_IVDECODER_MODE, "iv_hex": iv.hex(),
+            "cipher_hex": be21.body.hex(), "decrypted_body_hex": plain.hex(),
+        })
+        try:
+            parsed_info = self._parse_decrypted(trial_row, flow, be21, packet, frame_no, plain)
+            if parsed_info is not None:
                 self.parsed_business_records += 1
                 self._consecutive_errors = 0  # 成功则重置连续错误计数
                 return trial_row, parsed_info
-            except Exception as exc:
-                last_row = trial_row
-                last_error = f"parse_error:{mode}:{exc}"
-                trial_row["decrypt_status"] = f"parse_error:{exc}"
+            last_error = f"parse_unparsed:{RKPP_IVDECODER_MODE}:{trial_row.get('decrypt_status')}"
+        except Exception as exc:
+            last_error = f"parse_error:{RKPP_IVDECODER_MODE}:{exc}"
+            trial_row["decrypt_status"] = f"parse_error:{exc}"
 
         if last_error.endswith(":ok_unparsed"):
             self._record_unparsed(last_error, be21.seq)
         else:
             self._record_error(last_error, be21.seq)
-        return last_row, None
+        return trial_row, None
 
     def _record_unparsed(self, reason: str, seq: int) -> None:
         logger.debug("Packet seq=%s unparsed: %s", seq, reason)
@@ -701,7 +733,11 @@ class RkppAnalyzer:
             "key_ascii": printable_ascii(flow.key) if flow.key else "",
             **{k: "" for k in (
                 "decrypt_status", "decrypt_mode", "iv_hex", "cipher_hex", "decrypted_body_hex",
-                "transport_kind", "transport_layout", "transport_seq", "record_len",
+                "transport_kind", "transport_layout", "transport_seq",
+                "ivdecoder_plain_len", "ivdecoder_trailer_len", "ivdecoder_trailer_ok",
+                "ivdecoder_record_offset", "ivdecoder_header_hex", "ivdecoder_header_magic_hex",
+                "ivdecoder_body_length", "ivdecoder_body_length_matches",
+                "record_len",
                 "session_id_hex", "sub_id_hex",
                 "protocol_direction", "opcode", "opcode_hex", "raw_opcode", "raw_opcode_hex",
                 "opcode_normalized", "opcode_name", "opcode_desc",
@@ -771,6 +807,7 @@ class RkppAnalyzer:
             "seq": be21.seq, "body_len": be21.body_len,
             "header_extra_hex": be21.header_extra.hex(), "first_frame": frame_no,
             "first_time": float(packet.time) if hasattr(packet, "time") else None,
+            "decrypt_mode": row.get("decrypt_mode", ""),
             "decrypted_body_hex": plain.hex(),
         }
         record = proto.parse_record(pkt_dict)
@@ -783,6 +820,7 @@ class RkppAnalyzer:
         # schema-driven 解码（Mode 2 增强）
         self._update_opcode_metadata(row, record)
         decoded_payload, decoded_available = self._decode_schema_payload(record, be21.seq)
+        row["decode_source"] = record.get("_decode_source", "")
         decoded_str = _json_text(decoded_payload) if decoded_available else ""
         row["decoded_json"] = decoded_str
 
@@ -826,7 +864,6 @@ class RkppAnalyzer:
                 record["_schema_found"] = schema_result.get("schema_found", False)
                 record["_message_name"] = schema_result.get("message_name", "")
                 record["_decode_source"] = schema_result.get("decode_source", "")
-                row["decode_source"] = schema_result.get("decode_source", "")
         except Exception:
             logger.debug("schema decode failed for opcode=%s seq=%s",
                          record.get("opcode_hex"), seq, exc_info=True)

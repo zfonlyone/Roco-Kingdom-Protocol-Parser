@@ -22,6 +22,9 @@ import Data  # CSV 名称映射，延迟到首次查询时加载
 
 logger = logging.getLogger(__name__)
 
+RKPP_PROTO_PARSE_MAX_DEPTH = 100
+RKPP_PROTO_PARSE_MAX_FIELDS = 5000
+
 # ===========================================================================
 # [1] 底层 proto 原语
 # ===========================================================================
@@ -52,32 +55,18 @@ def maybe_utf8(blob: bytes) -> str | None:
 
 
 def strip_tsf4g_padding(data: bytes) -> bytes:
-    """移除腾讯 TSF4G 协议的尾部填充。"""
-    marker = b"tsf4g"
-    if data.rfind(marker) == len(data) - 6:
-        pad = data[-1]
-        # TSF4G 尾巴形如 "<校验/填充字节>tsf4g<N>"，N 是整个尾部长度。
-        # 历史抓包中常见 N=6；实测 live-decode 中也会出现 N=8/9/18。
-        if len(marker) + 1 <= pad <= 64 and len(data) >= pad:
-            return data[:-pad]
-        if pad == 1:
-            return data[:-1]
-        if 0 < pad <= 16 and len(data) >= pad and all(b == pad for b in data[-pad:]):
-            return data[:-pad]
-    return data
+    """Remove the TSF4G trailer described by the GCP wire DATA protocol."""
+    trailer_len = tsf4g_trailer_len(data)
+    return data[:-trailer_len] if trailer_len else data
 
 
 def tsf4g_trailer_len(data: bytes) -> int:
-    """返回可识别的 TSF4G 尾部长度；无尾部时返回 0。"""
+    """Return the TSF4G trailer length, or 0 when the protocol marker is absent."""
     marker = b"tsf4g"
-    if data.rfind(marker) != len(data) - 6:
+    if len(data) < 6 or data[-6:-1] != marker:
         return 0
     pad = data[-1]
-    if len(marker) + 1 <= pad <= 64 and len(data) >= pad:
-        return pad
-    if pad == 1:
-        return 1
-    if 0 < pad <= 16 and len(data) >= pad and all(b == pad for b in data[-pad:]):
+    if len(marker) + 1 <= pad <= 22 and len(data) >= pad:
         return pad
     return 0
 
@@ -211,8 +200,8 @@ def parse_proto_message(
     data: bytes,
     *,
     depth: int = 0,
-    max_depth: int = 10,
-    max_fields: int = 5000,
+    max_depth: int = RKPP_PROTO_PARSE_MAX_DEPTH,
+    max_fields: int = RKPP_PROTO_PARSE_MAX_FIELDS,
 ) -> dict[str, Any]:
     fields: list[dict[str, Any]] = []
     off, clean = 0, True
@@ -258,6 +247,8 @@ def parse_proto_message(
                     )
                     if sub["fields"] and sub["consumed"] == len(blob):
                         entry["sub"] = sub
+                elif blob:
+                    entry["truncated_by_depth"] = True
             elif wire_type == 5:
                 if off + 4 > len(data):
                     clean = False
@@ -630,7 +621,11 @@ def _build_payload_root(opcode: int, payload: bytes) -> tuple[dict[str, Any], st
         return {"fields": [], "consumed": len(payload), "clean": True}, special[0], special[1]
     if not payload:
         return _empty_root(), "protobuf", None
-    return parse_proto_message(payload), "protobuf", None
+    return parse_proto_message(
+        payload,
+        max_depth=RKPP_PROTO_PARSE_MAX_DEPTH,
+        max_fields=RKPP_PROTO_PARSE_MAX_FIELDS,
+    ), "protobuf", None
 
 
 def _is_probable_live_s2c_opcode(opcode: int) -> bool:
@@ -835,21 +830,72 @@ def _parse_record_live_c2s_short_heartbeat(body: bytes, common: dict[str, Any]) 
     }
 
 
-def parse_record(packet: dict[str, Any]) -> dict[str, Any] | None:
-    if packet.get("cmd") != 0x4013 or not packet.get("decrypted_body_hex"):
-        return None
-    body = bytes.fromhex(packet["decrypted_body_hex"])
-    common = {
-        "seq": packet["seq"], "direction": packet["direction"],
-        "first_frame": packet.get("first_frame"), "first_time": packet.get("first_time"),
-    }
-    record = (
+def _parse_record_body(body: bytes, common: dict[str, Any]) -> dict[str, Any] | None:
+    return (
         _parse_record_v14(body, common)
         or _parse_record_live_s2c(body, common)
         or _parse_record_live_c2s(body, common)
         or _parse_record_live_c2s_alt_7ca2(body, common)
         or _parse_record_live_c2s_short_heartbeat(body, common)
     )
+
+
+def _ivdecoder_meta(body: bytes, trailer_len: int) -> dict[str, Any]:
+    payload_without_trailer = body[:-trailer_len] if trailer_len else body
+    header = body[:32]
+    out: dict[str, Any] = {
+        "transport_envelope": "Ivdecoder",
+        "ivdecoder_record_offset": 16,
+        "ivdecoder_prefix_len": 16,
+        "ivdecoder_prefix_hex": body[:16].hex(),
+        "ivdecoder_header_hex": header.hex(),
+        "ivdecoder_plain_len": len(body),
+        "ivdecoder_plain_without_trailer_len": len(payload_without_trailer),
+        "ivdecoder_trailer_len": trailer_len,
+        "ivdecoder_trailer_ok": trailer_len > 0,
+        "ivdecoder_trailer_hex": body[-trailer_len:].hex() if trailer_len else "",
+    }
+    if len(body) >= 32:
+        declared_body_len = int.from_bytes(body[8:10], "big")
+        out.update({
+            "ivdecoder_counter1": int.from_bytes(body[0:4], "big"),
+            "ivdecoder_header_magic_hex": body[4:8].hex(),
+            "ivdecoder_body_length": declared_body_len,
+            "ivdecoder_body_length_matches": declared_body_len == len(payload_without_trailer) - 4,
+            "ivdecoder_const1_hex": body[12:16].hex(),
+            "ivdecoder_header_session_id_hex": f"0x{int.from_bytes(body[16:20], 'big'):08X}",
+            "ivdecoder_magic2_hex": body[20:22].hex(),
+            "ivdecoder_sub_id_hex": f"0x{int.from_bytes(body[22:24], 'big'):04X}",
+            "ivdecoder_const2_hex": body[24:28].hex(),
+            "ivdecoder_counter2_hex": f"0x{int.from_bytes(body[28:32], 'big'):08X}",
+        })
+    return out
+
+
+def _parse_ivdecoder_record(body: bytes, common: dict[str, Any]) -> dict[str, Any] | None:
+    if len(body) < 32:
+        return None
+    trailer_len = tsf4g_trailer_len(body)
+    if trailer_len == 0:
+        return None
+    record = _parse_record_body(body[16:], common)
+    if record is None:
+        return None
+    record.update(_ivdecoder_meta(body, trailer_len))
+    return record
+
+
+def parse_record(packet: dict[str, Any]) -> dict[str, Any] | None:
+    if packet.get("cmd") != 0x4013 or not packet.get("decrypted_body_hex"):
+        return None
+    if packet.get("decrypt_mode") != "Ivdecoder":
+        return None
+    body = bytes.fromhex(packet["decrypted_body_hex"])
+    common = {
+        "seq": packet["seq"], "direction": packet["direction"],
+        "first_frame": packet.get("first_frame"), "first_time": packet.get("first_time"),
+    }
+    record = _parse_ivdecoder_record(body, common)
     if record is None and common["direction"] == "c2s" and len(body) >= 8:
         logger.debug(
             "unsupported c2s frame without recognized transport layout: seq=%s body_len=%d",

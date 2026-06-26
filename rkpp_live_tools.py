@@ -32,12 +32,14 @@ from scapy.all import AsyncSniffer, PcapWriter  # type: ignore
 from rkpp_analyzer import RkppAnalyzer
 from rkpp_io import (CsvSink, MoveCsvSink, SessionLogger, ensure_output_dir,
                       iter_offline_packets, prompt_menu, prompt_server_mode, prompt_text)
-from rkpp_network import list_ifaces, load_key_from_file, packet_has_target_port, parse_key_text
+from rkpp_network import (get_default_iface, latest_key_path, list_ifaces,
+                          load_latest_key, packet_has_target_port,
+                          parse_key_text, set_default_iface)
 from rkpp_relay import OpcodeRelayServer
 from rkpp_reporter import ProtocolConsoleReporter
+from RKPP_worker import RKPP_PacketWorker
 
 DEFAULT_PORT = 8195
-SCRIPT_DIR   = Path(__file__).resolve().parent
 _BAD_KEY_EXIT_CODE = 2
 
 # 子命令配置：command -> (prefix, needs_csv, needs_reporter, stop_after_key)
@@ -68,8 +70,10 @@ def _run_session(analyzer: RkppAnalyzer, args: argparse.Namespace) -> None:
                 break
         return
     bpf     = None if args.no_bpf else f"tcp port {args.port}"
+    worker = RKPP_PacketWorker(analyzer, analyzer.session_logger)
+    worker.start()
     sniffer = AsyncSniffer(
-        iface=args.iface, store=False, prn=analyzer.process_packet,
+        iface=args.iface, store=False, prn=worker.submit,
         lfilter=lambda pkt: packet_has_target_port(pkt, args.port), filter=bpf,
     )
     sniffer.start()
@@ -83,6 +87,7 @@ def _run_session(analyzer: RkppAnalyzer, args: argparse.Namespace) -> None:
             sniffer.stop()
         except Exception:
             pass
+        worker.close()
 
 
 class _MultiListener:
@@ -100,6 +105,36 @@ def _close_optional(resource: object | None) -> None:
     close = getattr(resource, "close", None)
     if callable(close):
         close()
+
+
+def _resolve_runtime_iface(args: argparse.Namespace) -> str | None:
+    if getattr(args, "read_pcap", None):
+        return getattr(args, "iface", None)
+    if getattr(args, "iface", None):
+        return args.iface
+    default_iface = get_default_iface()
+    if default_iface:
+        args.iface = default_iface
+    return getattr(args, "iface", None)
+
+
+def _load_preset_key(
+    args: argparse.Namespace,
+    command: str,
+    session_logger: SessionLogger,
+) -> bytes | None:
+    if hasattr(args, "key") and args.key:
+        key = parse_key_text(args.key)
+        session_logger.log(f"[key] using provided key key_hex={key.hex()}")
+        return key
+    if command == "capture-key":
+        return None
+    key = load_latest_key()
+    if key:
+        session_logger.log(f"[key] loaded latest key from {latest_key_path()} key_hex={key.hex()}")
+        return key
+    session_logger.log("[key] no preset key; waiting for 0x1002 key refresh")
+    return None
 
 
 def _session_exit_code(
@@ -147,17 +182,20 @@ def run_command(args: argparse.Namespace) -> int:
     relay: OpcodeRelayServer | None = None
 
     try:
+        iface_before = getattr(args, "iface", None)
+        resolved_iface = _resolve_runtime_iface(args)
+        if not getattr(args, "read_pcap", None) and not iface_before and resolved_iface:
+            session_logger.log(f"[iface] using saved default interface: {resolved_iface}")
+
         if needs_csv:
             csv_path = getattr(args, "csv_out", None) or out_dir / "decoded_packets.csv"
             csv_sink = CsvSink(csv_path)
 
         if not args.read_pcap:
             pcap_path = args.pcap_out or out_dir / ("capture.pcap" if not needs_csv else "live_capture.pcap")
-            writer = PcapWriter(str(pcap_path), append=False, sync=True)
+            writer = PcapWriter(str(pcap_path), append=False, sync=False)
 
-        preset_key = None
-        if hasattr(args, "key") and args.key:
-            preset_key = parse_key_text(args.key)
+        preset_key = _load_preset_key(args, command, session_logger)
 
         if needs_reporter:
             reporter = ProtocolConsoleReporter(logger=session_logger)
@@ -187,7 +225,7 @@ def run_command(args: argparse.Namespace) -> int:
 
         mode = "offline" if args.read_pcap else "live"
         session_logger.log(
-            f"[startup] command={command} mode={mode} iface={args.iface or '<default>'} "
+            f"[startup] command={command} mode={mode} iface={args.iface or '<scapy-default>'} "
             f"port={args.port} out_dir={out_dir}"
             + (f" csv={csv_sink.csv_path} opencode_csv={csv_sink.opcode_csv_path}" if csv_sink else "")
             + (f" server_mode={getattr(args, 'server_mode', 'normal')}" if command == "opencode-server" else "")
@@ -222,7 +260,7 @@ def run_command(args: argparse.Namespace) -> int:
 
 def build_interactive_args() -> argparse.Namespace:
     choice = prompt_menu()
-    iface  = prompt_text("接口名", "以太网")
+    iface  = _prompt_iface()
     out_dir_str = prompt_text("输出目录（留空则自动创建）", "")
     out_dir = Path(out_dir_str) if out_dir_str else None
     base = argparse.Namespace(
@@ -234,16 +272,16 @@ def build_interactive_args() -> argparse.Namespace:
         return argparse.Namespace(**vars(base), command=command)
 
     key: str | None = None
-    for kp in ([out_dir / "key.txt"] if out_dir else []) + [SCRIPT_DIR / "key.txt"]:
-        kb = load_key_from_file(kp)
-        if kb:
-            key = kb.hex()
-            print(f"已读取 {kp.name}: {key}")
-            break
-    if key is None:
-        print("未找到 key.txt，需要手动输入秘钥。")
+    latest_key = load_latest_key()
+    if latest_key:
+        key = latest_key.hex()
+        print(f"已读取 {latest_key_path()}: {key}")
+    else:
+        print("未找到 latest.key，可留空等待 0x1002 自动刷新密钥。")
         while True:
-            raw = input("请输入秘钥（16位ASCII或32位hex）: ").strip()
+            raw = input("请输入秘钥（16位ASCII或32位hex，留空自动刷新）: ").strip()
+            if not raw:
+                break
             try:
                 key = parse_key_text(raw).hex()
                 break
@@ -261,6 +299,35 @@ def build_interactive_args() -> argparse.Namespace:
     )
 
 
+def _prompt_iface() -> str | None:
+    default_iface = get_default_iface()
+    while True:
+        default_label = default_iface or "Scapy默认"
+        raw = input(
+            f"接口名（回车使用默认，?=列出网卡，set=设置默认） [{default_label}]: "
+        ).strip()
+        if not raw:
+            return default_iface
+        if raw in {"?", "list"}:
+            list_ifaces(default_iface)
+            continue
+        if raw.lower() == "set":
+            list_ifaces(default_iface)
+            new_default = input("新的默认接口名: ").strip()
+            if not new_default:
+                print("默认接口未修改。")
+                continue
+            try:
+                set_default_iface(new_default)
+            except ValueError as exc:
+                print(f"默认接口设置失败: {exc}")
+                continue
+            default_iface = new_default
+            print(f"默认接口已设置为: {default_iface}")
+            continue
+        return raw
+
+
 # ---------------------------------------------------------------------------
 # argparse + main
 # ---------------------------------------------------------------------------
@@ -268,6 +335,8 @@ def build_interactive_args() -> argparse.Namespace:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RKPP 抓 key / 持续抓包解密导出工具")
     parser.add_argument("--list-ifaces", action="store_true")
+    parser.add_argument("--show-default-iface", action="store_true")
+    parser.add_argument("--set-default-iface")
     sub = parser.add_subparsers(dest="command")
 
     def _common(p):
@@ -319,6 +388,15 @@ def main() -> int:
     except Exception:
         pass
     args = build_parser().parse_args()
+    if args.set_default_iface:
+        path = set_default_iface(args.set_default_iface)
+        print(f"默认网卡已设置为: {args.set_default_iface}")
+        print(f"配置文件: {path}")
+        return 0
+    if args.show_default_iface:
+        default_iface = get_default_iface()
+        print(default_iface or "<unset>")
+        return 0
     if args.list_ifaces:
         list_ifaces()
         return 0

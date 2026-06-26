@@ -13,16 +13,15 @@
 
 """Schema-driven protocol decoding helpers.
 
-The module loads Data/opcode.json and Data/proto_schema.json lazily, translates
+The module loads opcode/proto schema data through :mod:`Data`, translates
 field-number proto trees into named dictionaries, and enriches known ids with
-local CSV names.
+local data names.
 """
 from __future__ import annotations
 
 import json
 import logging
 import struct
-from pathlib import Path
 from typing import Any
 
 import Data
@@ -30,13 +29,14 @@ import rkpp_opcode_payload
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_DIR = Path(__file__).resolve().parent / "Data"
-
 _VARINT_PACKED_TYPES = {
     "int32", "int64", "uint32", "uint64", "sint32", "sint64", "bool",
 }
 _FIXED32_PACKED_TYPES = {"fixed32", "sfixed32", "float"}
 _FIXED64_PACKED_TYPES = {"fixed64", "sfixed64", "double"}
+
+_SCHEMA_TREE_MAX_DEPTH = 100
+_CODEC_MESSAGE_RECURSION_LIMIT = rkpp_opcode_payload.DEFAULT_MESSAGE_RECURSION_LIMIT
 
 # ---------------------------------------------------------------------------
 # 全局懒加载缓存
@@ -106,26 +106,12 @@ def _load_json_file(path: Path, *, default: dict[str, Any], label: str) -> dict[
 def _ensure_loaded() -> tuple[dict[str, dict], dict[str, dict]]:
     global _opcode_map, _schema
     if _opcode_map is None:
-        op_path = _SCHEMA_DIR / "opcode.json"
-        if op_path.exists():
-            _opcode_map = _load_json_file(op_path, default={}, label="opcode.json")
-            logger.info("Loaded opcode.json: %d entries", len(_opcode_map))
-        else:
-            logger.warning("opcode.json not found at %s", op_path)
-            _opcode_map = {}
+        _opcode_map = Data.get_opcode_map()
+        logger.info("Loaded opcode map: %d entries", len(_opcode_map))
     if _schema is None:
-        sc_path = _SCHEMA_DIR / "proto_schema.json"
-        if sc_path.exists():
-            _schema = _load_json_file(
-                sc_path,
-                default={"messages": {}, "enums": {}},
-                label="proto_schema.json",
-            )
-            logger.info("Loaded proto_schema.json: %d messages, %d enums",
-                        len(_schema.get("messages", {})), len(_schema.get("enums", {})))
-        else:
-            logger.warning("proto_schema.json not found at %s", sc_path)
-            _schema = {"messages": {}, "enums": {}}
+        _schema = Data.get_proto_schema()
+        logger.info("Loaded proto schema: %d messages, %d enums",
+                    len(_schema.get("messages", {})), len(_schema.get("enums", {})))
     return _opcode_map, _schema
 
 
@@ -364,7 +350,7 @@ def decode_by_schema(
     raw_msg: dict[str, Any],
     message_name: str,
     *,
-    max_depth: int = 8,
+    max_depth: int = _SCHEMA_TREE_MAX_DEPTH,
     _depth: int = 0,
 ) -> dict[str, Any]:
     """将 parse_proto_message 的 field-number 树，按 schema 翻译为带字段名的 dict。
@@ -723,7 +709,13 @@ def _decode_payload_by_codec(
     def resolve_message(name: str) -> dict | None:
         return _codec_schema_for_message(msgs, name)
 
-    result = rkpp_opcode_payload.decode_opcode_payload(schema, payload, resolve_message)
+    result = rkpp_opcode_payload.decode_opcode_payload(
+        schema,
+        payload,
+        resolve_message,
+        max_depth=_CODEC_MESSAGE_RECURSION_LIMIT,
+        flattened_max_depth=rkpp_opcode_payload.DEFAULT_FLATTENED_CANDIDATE_DEPTH,
+    )
     return result.decoded, result.source
 
 
